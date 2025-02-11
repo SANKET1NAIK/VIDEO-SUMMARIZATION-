@@ -1,90 +1,71 @@
+import os
+from ultralytics import YOLO
 import cv2
-import sys
-import argparse
 
-def setup_video(video_path):
-    """
-    Initialize video playback from file or URL
-    Returns video capture object if successful, None if failed
-    """
-    try:
-        # Create video capture object
-        cap = cv2.VideoCapture(video_path)
-        
-        # Check if video opened successfully
-        if not cap.isOpened():
-            print(f"Error: Could not open video source: {video_path}")
-            return None
-            
-        # Get video properties
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        
-        print(f"Video Properties:")
-        print(f"Resolution: {width}x{height}")
-        print(f"FPS: {fps}")
-            
-        return cap
-        
-    except Exception as e:
-        print(f"Error initializing video: {str(e)}")
-        return None
+VIDEOS_DIR = os.path.join(".", "videos")
 
-def main():
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description='Play video from file or URL')
-    parser.add_argument('video_path', help='Path to video file or URL')
-    args = parser.parse_args()
-    
-    # Initialize video
-    cap = setup_video(args.video_path)
-    if cap is None:
-        sys.exit(1)
-    
-    # Create named window
-    window_name = "Video Player"
-    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
-    
-    print("\nControls:")
-    print("Press 'q' to quit")
-    print("Press 'space' to pause/resume")
-    
-    paused = False
-    try:
-        while True:
-            if not paused:
-                # Read frame
-                ret, frame = cap.read()
-                
-                # Check if video ended
-                if not ret:
-                    print("\nEnd of video")
-                    break
-                    
-                # Display the frame
-                cv2.imshow(window_name, frame)
-            
-            # Check for key presses
-            key = cv2.waitKey(1) & 0xFF
-            
-            # 'q' to quit
-            if key == ord('q'):
-                break
-                
-            # Space to pause/resume
-            elif key == ord(' '):
-                paused = not paused
-                status = "Paused" if paused else "Playing"
-                print(f"\nVideo {status}")
-                
-    except KeyboardInterrupt:
-        print("\nStopped by user")
-    
-    finally:
-        # Clean up
-        cap.release()
-        cv2.destroyAllWindows()
+video_path = os.path.join(VIDEOS_DIR, "tanmay.mp4")
+video_path_out = f"{video_path}_out.mp4"
 
-if __name__ == "__main__":
-    main()
+cap = cv2.VideoCapture(video_path)
+ret, frame = cap.read()
+H, W, _ = frame.shape
+out = cv2.VideoWriter(
+    video_path_out,
+    cv2.VideoWriter_fourcc(*"MP4V"),
+    int(cap.get(cv2.CAP_PROP_FPS)),
+    (W, H),
+)
+
+# Load both models
+water_model_path = os.path.join(".", "runs", "detect", "train", "weights", "water.pt")
+feeder_model_path = os.path.join(".", "runs", "detect", "train2", "weights", "best.pt")
+
+water_model = YOLO(water_model_path)  # Load water detection model
+feeder_model = YOLO(feeder_model_path)  # Load feeder detection model
+
+threshold = 0.5
+
+while ret:
+    # Run both models on the same frame
+    water_results = water_model(frame)[0]
+    feeder_results = feeder_model(frame)[0]
+
+    # Process water detection results
+    for result in water_results.boxes.data.tolist():
+        x1, y1, x2, y2, score, class_id = result
+        if score > threshold:
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 4)
+            cv2.putText(
+                frame,
+                water_results.names[int(class_id)].upper(),
+                (int(x1), int(y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.3,
+                (0, 255, 0),
+                3,
+                cv2.LINE_AA,
+            )
+
+    # Process feeder detection results
+    for result in feeder_results.boxes.data.tolist():
+        x1, y1, x2, y2, score, class_id = result
+        if score > threshold:
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 4)
+            cv2.putText(
+                frame,
+                feeder_results.names[int(class_id)].upper(),
+                (int(x1), int(y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.3,
+                (255, 0, 0),
+                3,
+                cv2.LINE_AA,
+            )
+
+    out.write(frame)
+    ret, frame = cap.read()
+
+cap.release()
+out.release()
+cv2.destroyAllWindows()
