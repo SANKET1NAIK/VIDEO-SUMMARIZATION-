@@ -1,10 +1,16 @@
 import os
 from ultralytics import YOLO
 import cv2
+import torch
+from ultralytics.nn.tasks import DetectionModel
+from pathlib import Path
+
+# Add DetectionModel to safe globals before loading models
+torch.serialization.add_safe_globals([DetectionModel])
 
 VIDEOS_DIR = os.path.join(".", "videos")
 
-video_path = os.path.join(VIDEOS_DIR, "tanmay.mp4")
+video_path = os.path.join(VIDEOS_DIR, "walk.mp4")
 video_path_out = f"{video_path}_out.mp4"
 
 cap = cv2.VideoCapture(video_path)
@@ -12,17 +18,18 @@ ret, frame = cap.read()
 H, W, _ = frame.shape
 out = cv2.VideoWriter(
     video_path_out,
-    cv2.VideoWriter_fourcc(*"MP4V"),
+    cv2.VideoWriter_fourcc(*"avc1"),
     int(cap.get(cv2.CAP_PROP_FPS)),
     (W, H),
 )
 
 # Load both models
-water_model_path = os.path.join(".", "runs", "detect", "train", "weights", "water.pt")
-feeder_model_path = os.path.join(".", "runs", "detect", "train2", "weights", "best.pt")
+water_model_path = os.path.join(".","water.pt")
+feeder_model_path = os.path.join(".","feeder.pt")
 
-water_model = YOLO(water_model_path)  # Load water detection model
-feeder_model = YOLO(feeder_model_path)  # Load feeder detection model
+# Alternative loading method
+water_model = YOLO(water_model_path, task='detect')  # Explicitly specify task
+feeder_model = YOLO(feeder_model_path, task='detect')  # Explicitly specify task
 
 threshold = 0.5
 
