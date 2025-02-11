@@ -3,6 +3,7 @@ import numpy as np
 from easy_ViTPose.easy_ViTPose import VitInference
 import os
 from collections import deque
+import torch
 
 
 class CombinedVisualizer:
@@ -44,6 +45,7 @@ class CombinedVisualizer:
             color = colors.get(activity, (128, 128, 128))
             cv2.rectangle(defrag_image, (x_start, 0), (x_end, 80), color, -1)
 
+        # Create legend and statistics
         font = cv2.FONT_HERSHEY_SIMPLEX
         legend_items = [
             ("Walking", (0, 0, 255)),
@@ -87,13 +89,17 @@ class CombinedVisualizer:
 
 class HorseGaitMonitor:
     def __init__(self, model_path, yolo_path, output_dir="monitoring_output"):
+        # Use CUDA device
+        self.device = "cuda"
+        
+        # Initialize model with CUDA support
         self.model = VitInference(
             model_path,
             yolo_path,
             model_name="s",
             yolo_size=320,
             is_video=True,
-            device="cpu",
+            device=self.device
         )
 
         self.output_dir = output_dir
@@ -145,29 +151,29 @@ class HorseGaitMonitor:
                 "R_B_Hip": kp_array[14][:2],  # Right Back Hip
             }
 
-            # Calculate leg angles
+            # Calculate leg angles using CUDA tensors
             left_front_angle = self.calculate_angle(
-                np.array(leg_points["L_F_Hip"]),
-                np.array(leg_points["L_F_Knee"]),
-                np.array(leg_points["L_F_Paw"]),
+                torch.tensor(leg_points["L_F_Hip"], device=self.device),
+                torch.tensor(leg_points["L_F_Knee"], device=self.device),
+                torch.tensor(leg_points["L_F_Paw"], device=self.device),
             )
 
             right_front_angle = self.calculate_angle(
-                np.array(leg_points["R_F_Hip"]),
-                np.array(leg_points["R_F_Knee"]),
-                np.array(leg_points["R_F_Paw"]),
+                torch.tensor(leg_points["R_F_Hip"], device=self.device),
+                torch.tensor(leg_points["R_F_Knee"], device=self.device),
+                torch.tensor(leg_points["R_F_Paw"], device=self.device),
             )
 
             left_back_angle = self.calculate_angle(
-                np.array(leg_points["L_B_Hip"]),
-                np.array(leg_points["L_B_Knee"]),
-                np.array(leg_points["L_B_Paw"]),
+                torch.tensor(leg_points["L_B_Hip"], device=self.device),
+                torch.tensor(leg_points["L_B_Knee"], device=self.device),
+                torch.tensor(leg_points["L_B_Paw"], device=self.device),
             )
 
             right_back_angle = self.calculate_angle(
-                np.array(leg_points["R_B_Hip"]),
-                np.array(leg_points["R_B_Knee"]),
-                np.array(leg_points["R_B_Paw"]),
+                torch.tensor(leg_points["R_B_Hip"], device=self.device),
+                torch.tensor(leg_points["R_B_Knee"], device=self.device),
+                torch.tensor(leg_points["R_B_Paw"], device=self.device),
             )
 
             # Check for pawing
@@ -187,25 +193,27 @@ class HorseGaitMonitor:
                 return "sitting"
 
             # Check for walking/standing
-            paw_positions = np.array(
+            paw_positions = torch.tensor(
                 [
                     leg_points["L_F_Paw"],
                     leg_points["R_F_Paw"],
                     leg_points["L_B_Paw"],
                     leg_points["R_B_Paw"],
-                ]
+                ],
+                device=self.device
             )
 
             if self.prev_positions is not None:
-                movements = np.linalg.norm(paw_positions - self.prev_positions, axis=1)
-                self.movement_buffer.append(np.mean(movements))
+                prev_positions_tensor = torch.tensor(self.prev_positions, device=self.device)
+                movements = torch.norm(paw_positions - prev_positions_tensor, dim=1)
+                self.movement_buffer.append(torch.mean(movements).item())
                 if len(self.movement_buffer) > 10:
                     self.movement_buffer.pop(0)
 
                 avg_movement = np.mean(self.movement_buffer)
                 movement_detected = avg_movement > 5.0
 
-            self.prev_positions = paw_positions
+            self.prev_positions = paw_positions.cpu().numpy()
 
         current_state = "walking" if movement_detected else "standing"
         self.state_buffer.append(current_state)
@@ -245,7 +253,13 @@ class HorseGaitMonitor:
             cv2.imwrite(filename, frame)
 
     def process_video(self, video_path):
-        cap = cv2.VideoCapture(video_path)
+        # Try to use CUDA video capture
+        try:
+            cap = cv2.cudacodec.createVideoReader(video_path)
+        except:
+            print("CUDA video capture not available, falling back to CPU")
+            cap = cv2.VideoCapture(video_path)
+            
         if not cap.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
 
@@ -256,8 +270,21 @@ class HorseGaitMonitor:
 
         combined_height = height + 150
         output_path = os.path.join(self.output_dir, "video_with_analysis.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, combined_height))
+        
+        # Try to use hardware-accelerated encoder
+        try:
+            out = cv2.cudacodec.createVideoWriter(
+                output_path, 
+                cv2.cudacodec.H264, 
+                fps, 
+                (width, combined_height)
+            )
+            using_cuda_writer = True
+        except:
+            print("CUDA video writer not available, falling back to CPU")
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(output_path, fourcc, fps, (width, combined_height))
+            using_cuda_writer = False
 
         frame_count = 0
         current_state = None
@@ -267,12 +294,21 @@ class HorseGaitMonitor:
 
         try:
             while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+                # Read frame using appropriate method
+                if isinstance(cap, cv2.cudacodec.VideoReader):
+                    ret, cuda_frame = cap.read()
+                    if not ret:
+                        break
+                    frame = cuda_frame.download()
+                else:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
 
-                keypoints = self.model.inference(frame)
-                current_state = self.detect_state(keypoints)
+                # Process frame on GPU
+                with torch.cuda.device(0):
+                    keypoints = self.model.inference(frame)
+                    current_state = self.detect_state(keypoints)
 
                 if current_state != last_announced_state:
                     print(f"Frame {frame_count}: Horse is now {current_state}")
@@ -284,8 +320,15 @@ class HorseGaitMonitor:
                 self.visualizer.update(current_state)
                 combined_display = self.visualizer.create_visualization(annotated_frame)
 
+                # Write frame using appropriate method
+                if using_cuda_writer:
+                    cuda_combined = cv2.cuda_GpuMat()
+                    cuda_combined.upload(combined_display)
+                    out.write(cuda_combined)
+                else:
+                    out.write(combined_display)
+
                 cv2.imshow("Horse Gait Analysis", combined_display)
-                out.write(combined_display)
 
                 frame_count += 1
                 if frame_count % 30 == 0:
@@ -296,8 +339,14 @@ class HorseGaitMonitor:
                     break
 
         finally:
-            cap.release()
-            out.release()
+            if isinstance(cap, cv2.cudacodec.VideoReader):
+                cap.release()
+            else:
+                cap.release()
+            if using_cuda_writer:
+                out.release()
+            else:
+                out.release()
             cv2.destroyAllWindows()
             print(f"\nProcessing complete! Output saved to: {output_path}")
 
