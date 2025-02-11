@@ -2,110 +2,114 @@ import os
 from ultralytics import YOLO
 import cv2
 import torch
+import torch.serialization
 
+# Add the DetectionModel to safe globals
+torch.serialization.add_safe_globals(['ultralytics.nn.tasks.DetectionModel'])
+
+# Set up video paths
 VIDEOS_DIR = os.path.join(".", "videos")
 video_path = os.path.join(VIDEOS_DIR, "tanmay.mp4")
-video_path_out = f"{video_path}_out.mp4"
+video_path_out = os.path.join(VIDEOS_DIR, "output.avi")  # Changed to .avi format
 
 # Initialize video capture
 cap = cv2.VideoCapture(video_path)
-ret, frame = cap.read()
-H, W, _ = frame.shape
+if not cap.isOpened():
+    raise ValueError("Failed to open video file")
 
-# Use hardware-accelerated encoding for Jetson
-gst_out = f"appsrc ! video/x-raw, format=BGR ! videoconvert ! video/x-raw, format=I420 ! nvvideoconvert ! nvv4l2h264enc ! h264parse ! qtmux ! filesink location={video_path_out}"
+# Get video properties
+fps = int(cap.get(cv2.CAP_PROP_FPS))
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+# Initialize video writer with MJPG codec (more compatible)
+fourcc = cv2.VideoWriter_fourcc(*'MJPG')
 out = cv2.VideoWriter(
-    gst_out,
-    cv2.CAP_GSTREAMER,
-    int(cap.get(cv2.CAP_PROP_FPS)),
-    (W, H)
+    video_path_out,
+    fourcc,
+    fps,
+    (width, height)
 )
 
 if not out.isOpened():
-    # Fallback to software encoding if GStreamer fails
-    out = cv2.VideoWriter(
-        video_path_out,
-        cv2.VideoWriter_fourcc(*'avc1'),  # Try H.264 codec
-        int(cap.get(cv2.CAP_PROP_FPS)),
-        (W, H)
-    )
+    raise ValueError("Failed to create video writer")
 
-# Load models with proper error handling
-water_model_path = os.path.join(".", "runs", "detect", "train", "weights", "water.pt")
-feeder_model_path = os.path.join(".", "runs", "detect", "train2", "weights", "best.pt")
-
+# Load YOLO models
 try:
-    # Load YOLO models with specific device placement
-    water_model = YOLO(water_model_path)
-    water_model.to('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    feeder_model = YOLO(feeder_model_path)
-    feeder_model.to('cuda' if torch.cuda.is_available() else 'cpu')
+    # First attempt: Load directly with YOLO
+    water_model = YOLO('runs/detect/train/weights/water.pt')
+    feeder_model = YOLO('runs/detect/train2/weights/best.pt')
 except Exception as e:
-    print(f"Error loading models: {str(e)}")
-    # Try alternative loading method
-    water_model = torch.load(water_model_path, map_location='cpu', weights_only=True)
-    feeder_model = torch.load(feeder_model_path, map_location='cpu', weights_only=True)
+    print(f"First loading attempt failed: {e}")
+    try:
+        # Second attempt: Load with torch.load and weights_only=False
+        water_model = YOLO(torch.load('runs/detect/train/weights/water.pt', 
+                                    map_location='cpu', 
+                                    weights_only=False))
+        feeder_model = YOLO(torch.load('runs/detect/train2/weights/best.pt', 
+                                     map_location='cpu', 
+                                     weights_only=False))
+    except Exception as e:
+        print(f"Second loading attempt failed: {e}")
+        raise
 
 threshold = 0.5
 
 try:
-    while ret:
-        # Run inference with error handling
-        try:
-            water_results = water_model(frame)[0]
-            feeder_results = feeder_model(frame)[0]
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                # Handle CUDA out of memory
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                # Process a resized frame
-                small_frame = cv2.resize(frame, (W//2, H//2))
-                water_results = water_model(small_frame)[0]
-                feeder_results = feeder_model(small_frame)[0]
-            else:
-                raise e
-
-        # Process water detection results
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        # Run detection
+        water_results = water_model(frame)[0]
+        feeder_results = feeder_model(frame)[0]
+        
+        # Draw water detections
         for result in water_results.boxes.data.tolist():
             x1, y1, x2, y2, score, class_id = result
             if score > threshold:
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 4)
-                cv2.putText(
-                    frame,
-                    water_results.names[int(class_id)].upper(),
-                    (int(x1), int(y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.3,
-                    (0, 255, 0),
-                    3,
-                    cv2.LINE_AA,
-                )
-
-        # Process feeder detection results
+                cv2.rectangle(frame, 
+                            (int(x1), int(y1)), 
+                            (int(x2), int(y2)), 
+                            (0, 255, 0), 
+                            2)
+                cv2.putText(frame,
+                           f"Water {score:.2f}",
+                           (int(x1), int(y1 - 5)),
+                           cv2.FONT_HERSHEY_SIMPLEX,
+                           0.5,
+                           (0, 255, 0),
+                           2)
+        
+        # Draw feeder detections
         for result in feeder_results.boxes.data.tolist():
             x1, y1, x2, y2, score, class_id = result
             if score > threshold:
-                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 4)
-                cv2.putText(
-                    frame,
-                    feeder_results.names[int(class_id)].upper(),
-                    (int(x1), int(y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.3,
-                    (255, 0, 0),
-                    3,
-                    cv2.LINE_AA,
-                )
-
+                cv2.rectangle(frame, 
+                            (int(x1), int(y1)), 
+                            (int(x2), int(y2)), 
+                            (255, 0, 0), 
+                            2)
+                cv2.putText(frame,
+                           f"Feeder {score:.2f}",
+                           (int(x1), int(y1 - 5)),
+                           cv2.FONT_HERSHEY_SIMPLEX,
+                           0.5,
+                           (255, 0, 0),
+                           2)
+        
+        # Write frame
         out.write(frame)
-        ret, frame = cap.read()
+        
+        # Display frame (optional)
+        cv2.imshow('Detection', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-except Exception as e:
-    print(f"Error during processing: {str(e)}")
 finally:
     # Clean up
     cap.release()
     out.release()
     cv2.destroyAllWindows()
+    print("Processing complete!")
