@@ -3,6 +3,7 @@ import numpy as np
 from easy_ViTPose.easy_ViTPose import VitInference
 import os
 from collections import deque
+import torch
 
 
 class CombinedVisualizer:
@@ -87,19 +88,21 @@ class CombinedVisualizer:
 
 class HorseGaitMonitor:
     def __init__(self, model_path, yolo_path, output_dir="monitoring_output"):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
         self.model = VitInference(
             model_path,
             yolo_path,
             model_name="s",
             yolo_size=320,
             is_video=True,
-            device="cpu",
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
 
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        # Create directories for saving frames
         self.pose_dirs = {
             "standing": os.path.join(output_dir, "standing"),
             "walking": os.path.join(output_dir, "walking"),
@@ -115,12 +118,19 @@ class HorseGaitMonitor:
         self.visualizer = CombinedVisualizer()
 
     def calculate_angle(self, p1, p2, p3):
-        """Calculate angle between three points."""
+        import math
+
+        p1 = torch.tensor(p1, device=self.device)
+        p2 = torch.tensor(p2, device=self.device)
+        p3 = torch.tensor(p3, device=self.device)
+
         v1 = p1 - p2
         v2 = p3 - p2
 
-        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-        angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+        cos_angle = torch.dot(v1, v2) / (torch.norm(v1) * torch.norm(v2))
+        angle = math.degrees(
+            torch.arccos(torch.clamp(cos_angle, -1.0, 1.0)).cpu().item()
+        )
 
         return angle
 
@@ -129,52 +139,50 @@ class HorseGaitMonitor:
         movement_detected = False
 
         for person_id, kp_array in keypoints.items():
-            # Extract leg keypoints
+            kp_tensor = torch.tensor(kp_array, device=self.device)
+
             leg_points = {
-                "L_F_Knee": kp_array[6][:2],  # Left Front Knee
-                "L_F_Paw": kp_array[7][:2],  # Left Front Paw
-                "R_F_Knee": kp_array[9][:2],  # Right Front Knee
-                "R_F_Paw": kp_array[10][:2],  # Right Front Paw
-                "L_B_Knee": kp_array[12][:2],  # Left Back Knee
-                "L_B_Paw": kp_array[13][:2],  # Left Back Paw
-                "R_B_Knee": kp_array[15][:2],  # Right Back Knee
-                "R_B_Paw": kp_array[16][:2],  # Right Back Paw
-                "L_F_Hip": kp_array[5][:2],  # Left Front Hip
-                "R_F_Hip": kp_array[8][:2],  # Right Front Hip
-                "L_B_Hip": kp_array[11][:2],  # Left Back Hip
-                "R_B_Hip": kp_array[14][:2],  # Right Back Hip
+                "L_F_Knee": kp_tensor[6][:2],
+                "L_F_Paw": kp_tensor[7][:2],
+                "R_F_Knee": kp_tensor[9][:2],
+                "R_F_Paw": kp_tensor[10][:2],
+                "L_B_Knee": kp_tensor[12][:2],
+                "L_B_Paw": kp_tensor[13][:2],
+                "R_B_Knee": kp_tensor[15][:2],
+                "R_B_Paw": kp_tensor[16][:2],
+                "L_F_Hip": kp_tensor[5][:2],
+                "R_F_Hip": kp_tensor[8][:2],
+                "L_B_Hip": kp_tensor[11][:2],
+                "R_B_Hip": kp_tensor[14][:2],
             }
 
-            # Calculate leg angles
             left_front_angle = self.calculate_angle(
-                np.array(leg_points["L_F_Hip"]),
-                np.array(leg_points["L_F_Knee"]),
-                np.array(leg_points["L_F_Paw"]),
+                leg_points["L_F_Hip"],
+                leg_points["L_F_Knee"],
+                leg_points["L_F_Paw"],
             )
 
             right_front_angle = self.calculate_angle(
-                np.array(leg_points["R_F_Hip"]),
-                np.array(leg_points["R_F_Knee"]),
-                np.array(leg_points["R_F_Paw"]),
+                leg_points["R_F_Hip"],
+                leg_points["R_F_Knee"],
+                leg_points["R_F_Paw"],
             )
 
             left_back_angle = self.calculate_angle(
-                np.array(leg_points["L_B_Hip"]),
-                np.array(leg_points["L_B_Knee"]),
-                np.array(leg_points["L_B_Paw"]),
+                leg_points["L_B_Hip"],
+                leg_points["L_B_Knee"],
+                leg_points["L_B_Paw"],
             )
 
             right_back_angle = self.calculate_angle(
-                np.array(leg_points["R_B_Hip"]),
-                np.array(leg_points["R_B_Knee"]),
-                np.array(leg_points["R_B_Paw"]),
+                leg_points["R_B_Hip"],
+                leg_points["R_B_Knee"],
+                leg_points["R_B_Paw"],
             )
 
-            # Check for pawing
             if 100 <= left_front_angle <= 130 or 100 <= right_front_angle <= 130:
                 return "pawing"
 
-            # Check for sitting
             if all(
                 angle < 90
                 for angle in [
@@ -186,8 +194,7 @@ class HorseGaitMonitor:
             ):
                 return "sitting"
 
-            # Check for walking/standing
-            paw_positions = np.array(
+            paw_positions = torch.stack(
                 [
                     leg_points["L_F_Paw"],
                     leg_points["R_F_Paw"],
@@ -197,15 +204,18 @@ class HorseGaitMonitor:
             )
 
             if self.prev_positions is not None:
-                movements = np.linalg.norm(paw_positions - self.prev_positions, axis=1)
-                self.movement_buffer.append(np.mean(movements))
+                prev_positions_tensor = torch.tensor(
+                    self.prev_positions, device=self.device
+                )
+                movements = torch.norm(paw_positions - prev_positions_tensor, dim=1)
+                self.movement_buffer.append(torch.mean(movements).cpu().item())
                 if len(self.movement_buffer) > 10:
                     self.movement_buffer.pop(0)
 
                 avg_movement = np.mean(self.movement_buffer)
                 movement_detected = avg_movement > 5.0
 
-            self.prev_positions = paw_positions
+            self.prev_positions = paw_positions.cpu().numpy()
 
         current_state = "walking" if movement_detected else "standing"
         self.state_buffer.append(current_state)
