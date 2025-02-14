@@ -30,11 +30,11 @@ class CombinedVisualizer:
         defrag_image = np.ones((defrag_height, defrag_width, 3), dtype=np.uint8) * 255
 
         colors = {
-            "walking": (0, 0, 255),
-            "standing": (255, 0, 0),
-            "sitting": (0, 255, 0),
-            "pawing": (255, 165, 0),
-            "Unknown": (128, 128, 128),
+            "walking": (0, 0, 255),  # Red
+            "standing": (255, 0, 0),  # Blue
+            "sitting": (0, 255, 0),  # Green
+            "pawing": (255, 165, 0),  # Orange
+            "Unknown": (128, 128, 128),  # Gray
         }
 
         segment_width = defrag_width // self.window_size
@@ -78,18 +78,11 @@ class CombinedVisualizer:
             x_offset += 160
 
         combined_height = frame_height + defrag_height
-        combined_image = cv2.cuda_GpuMat(combined_height, frame_width, cv2.CV_8UC3)
-        combined_image.upload(np.zeros((combined_height, frame_width, 3), dtype=np.uint8))
-        
-        frame_gpu = cv2.cuda_GpuMat()
-        frame_gpu.upload(frame)
-        defrag_gpu = cv2.cuda_GpuMat()
-        defrag_gpu.upload(defrag_image)
-        
-        frame_gpu.copyTo(combined_image[0:frame_height, 0:frame_width])
-        defrag_gpu.copyTo(combined_image[frame_height:combined_height, 0:frame_width])
-        
-        return combined_image.download()
+        combined_image = np.zeros((combined_height, frame_width, 3), dtype=np.uint8)
+        combined_image[:frame_height] = frame
+        combined_image[frame_height:] = defrag_image
+
+        return combined_image
 
 
 class HorseGaitMonitor:
@@ -100,12 +93,13 @@ class HorseGaitMonitor:
             model_name="s",
             yolo_size=320,
             is_video=True,
-            device="cuda",
+            device="cpu",
         )
 
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
+        # Create directories for saving frames
         self.pose_dirs = {
             "standing": os.path.join(output_dir, "standing"),
             "walking": os.path.join(output_dir, "walking"),
@@ -119,27 +113,15 @@ class HorseGaitMonitor:
         self.movement_buffer = []
         self.state_buffer = []
         self.visualizer = CombinedVisualizer()
-        
-        self.stream = cv2.cuda.Stream()
-        self.gpu_resize = cv2.cuda.resize
-        self.gpu_cvtColor = cv2.cuda.cvtColor
-        
-        # Initialize CUDA image filters
-        self.gaussian_filter = cv2.cuda.createGaussianFilter(cv2.CV_8UC3, cv2.CV_8UC3, (5, 5), 1.5)
-        self.bilateral_filter = cv2.cuda.createBilateralFilter(cv2.CV_8UC3, 5, 75, 75)
-
-    def preprocess_frame(self, frame_gpu):
-        # Apply CUDA-accelerated preprocessing
-        filtered_frame = cv2.cuda_GpuMat(frame_gpu.size(), frame_gpu.type())
-        self.gaussian_filter.apply(frame_gpu, filtered_frame, stream=self.stream)
-        self.bilateral_filter.apply(filtered_frame, frame_gpu, stream=self.stream)
-        return frame_gpu
 
     def calculate_angle(self, p1, p2, p3):
+        """Calculate angle between three points."""
         v1 = p1 - p2
         v2 = p3 - p2
+
         cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
         angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+
         return angle
 
     def detect_state(self, keypoints):
@@ -147,21 +129,23 @@ class HorseGaitMonitor:
         movement_detected = False
 
         for person_id, kp_array in keypoints.items():
+            # Extract leg keypoints
             leg_points = {
-                "L_F_Knee": kp_array[6][:2],
-                "L_F_Paw": kp_array[7][:2],
-                "R_F_Knee": kp_array[9][:2],
-                "R_F_Paw": kp_array[10][:2],
-                "L_B_Knee": kp_array[12][:2],
-                "L_B_Paw": kp_array[13][:2],
-                "R_B_Knee": kp_array[15][:2],
-                "R_B_Paw": kp_array[16][:2],
-                "L_F_Hip": kp_array[5][:2],
-                "R_F_Hip": kp_array[8][:2],
-                "L_B_Hip": kp_array[11][:2],
-                "R_B_Hip": kp_array[14][:2],
+                "L_F_Knee": kp_array[6][:2],  # Left Front Knee
+                "L_F_Paw": kp_array[7][:2],  # Left Front Paw
+                "R_F_Knee": kp_array[9][:2],  # Right Front Knee
+                "R_F_Paw": kp_array[10][:2],  # Right Front Paw
+                "L_B_Knee": kp_array[12][:2],  # Left Back Knee
+                "L_B_Paw": kp_array[13][:2],  # Left Back Paw
+                "R_B_Knee": kp_array[15][:2],  # Right Back Knee
+                "R_B_Paw": kp_array[16][:2],  # Right Back Paw
+                "L_F_Hip": kp_array[5][:2],  # Left Front Hip
+                "R_F_Hip": kp_array[8][:2],  # Right Front Hip
+                "L_B_Hip": kp_array[11][:2],  # Left Back Hip
+                "R_B_Hip": kp_array[14][:2],  # Right Back Hip
             }
 
+            # Calculate leg angles
             left_front_angle = self.calculate_angle(
                 np.array(leg_points["L_F_Hip"]),
                 np.array(leg_points["L_F_Knee"]),
@@ -186,9 +170,11 @@ class HorseGaitMonitor:
                 np.array(leg_points["R_B_Paw"]),
             )
 
+            # Check for pawing
             if 100 <= left_front_angle <= 130 or 100 <= right_front_angle <= 130:
                 return "pawing"
 
+            # Check for sitting
             if all(
                 angle < 90
                 for angle in [
@@ -200,6 +186,7 @@ class HorseGaitMonitor:
             ):
                 return "sitting"
 
+            # Check for walking/standing
             paw_positions = np.array(
                 [
                     leg_points["L_F_Paw"],
@@ -227,17 +214,21 @@ class HorseGaitMonitor:
 
         return max(set(self.state_buffer), key=self.state_buffer.count)
 
-    def draw_state_annotation(self, frame_gpu, state):
-        frame_cpu = frame_gpu.download()
+    def draw_state_annotation(self, frame, state):
+        if isinstance(frame, np.ndarray):
+            annotated_frame = frame.copy()
+        else:
+            annotated_frame = np.array(frame)
+
         colors = {
-            "standing": (255, 0, 0),
-            "walking": (0, 0, 255),
-            "sitting": (0, 255, 0),
-            "pawing": (255, 165, 0),
+            "standing": (255, 0, 0),  # Blue
+            "walking": (0, 0, 255),  # Red
+            "sitting": (0, 255, 0),  # Green
+            "pawing": (255, 165, 0),  # Orange
         }
-        
+
         cv2.putText(
-            frame_cpu,
+            annotated_frame,
             f"State: {state.upper()}",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -245,53 +236,28 @@ class HorseGaitMonitor:
             colors.get(state, (128, 128, 128)),
             2,
         )
-        
-        result_gpu = cv2.cuda_GpuMat()
-        result_gpu.upload(frame_cpu)
-        return result_gpu
 
-    def save_frame(self, frame_gpu, state, frame_count):
+        return annotated_frame
+
+    def save_frame(self, frame, state, frame_count):
         if state in self.pose_dirs:
             filename = os.path.join(self.pose_dirs[state], f"frame_{frame_count}.jpg")
-            frame_cpu = frame_gpu.download()
-            cv2.imwrite(filename, frame_cpu)
+            cv2.imwrite(filename, frame)
 
     def process_video(self, video_path):
-        # Try to use CUDA video decoder
-        try:
-            cap = cv2.cudacodec.createVideoReader(video_path)
-            using_cuda_decoder = True
-        except:
-            cap = cv2.VideoCapture(video_path)
-            using_cuda_decoder = False
-            
-        if not (using_cuda_decoder or cap.isOpened()):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
 
-        if using_cuda_decoder:
-            width = cap.format().width
-            height = cap.format().height
-            fps = cap.format().fps
-            total_frames = int(cap.format().totalFrames)
-        else:
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         combined_height = height + 150
         output_path = os.path.join(self.output_dir, "video_with_analysis.mp4")
-        
-        # Try to use CUDA video encoder
-        try:
-            out = cv2.cudacodec.createVideoWriter(output_path, 
-                                                (width, combined_height),
-                                                fps)
-            using_cuda_encoder = True
-        except:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, combined_height))
-            using_cuda_encoder = False
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, combined_height))
 
         frame_count = 0
         current_state = None
@@ -301,43 +267,25 @@ class HorseGaitMonitor:
 
         try:
             while True:
-                if using_cuda_decoder:
-                    ret, frame_gpu = cap.nextFrame()
-                    if not ret:
-                        break
-                    frame = frame_gpu.download()
-                else:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    frame_gpu = cv2.cuda_GpuMat()
-                    frame_gpu.upload(frame)
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-                # Preprocess frame using CUDA
-                frame_gpu = self.preprocess_frame(frame_gpu)
-
-                # VitPose inference (requires CPU tensor)
-                keypoints = self.model.inference(frame_gpu.download())
+                keypoints = self.model.inference(frame)
                 current_state = self.detect_state(keypoints)
 
                 if current_state != last_announced_state:
                     print(f"Frame {frame_count}: Horse is now {current_state}")
                     last_announced_state = current_state
 
-                annotated_frame_gpu = self.draw_state_annotation(frame_gpu, current_state)
-                self.save_frame(annotated_frame_gpu, current_state, frame_count)
+                annotated_frame = self.draw_state_annotation(frame, current_state)
+                self.save_frame(annotated_frame, current_state, frame_count)
 
                 self.visualizer.update(current_state)
-                combined_display = self.visualizer.create_visualization(annotated_frame_gpu.download())
+                combined_display = self.visualizer.create_visualization(annotated_frame)
 
                 cv2.imshow("Horse Gait Analysis", combined_display)
-                
-                if using_cuda_encoder:
-                    combined_gpu = cv2.cuda_GpuMat()
-                    combined_gpu.upload(combined_display)
-                    out.write(combined_gpu)
-                else:
-                    out.write(combined_display)
+                out.write(combined_display)
 
                 frame_count += 1
                 if frame_count % 30 == 0:
@@ -348,16 +296,9 @@ class HorseGaitMonitor:
                     break
 
         finally:
-            if using_cuda_decoder:
-                cap.release()
-            else:
-                cap.release()
-            if using_cuda_encoder:
-                out.release()
-            else:
-                out.release()
+            cap.release()
+            out.release()
             cv2.destroyAllWindows()
-            cv2.cuda.destroyAllWindows()
             print(f"\nProcessing complete! Output saved to: {output_path}")
 
 
