@@ -303,7 +303,7 @@ class HorseGaitMonitor:
 
 
 def main():
-    model_path = "vitpose-l-ap10k.engine"
+    model_path = "vitpose-l-ap10k.onnx"
     yolo_path = "yolov8x.pt"
     monitor = HorseGaitMonitor(model_path, yolo_path)
 
