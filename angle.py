@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
-from easy_ViTPose.easy_ViTPose import VitInference
+import pycuda.driver as cuda
+import pycuda.autoinit
+import tensorrt as trt
 import os
 from collections import deque
-
 
 class CombinedVisualizer:
     def __init__(self, window_size=100):
@@ -86,16 +87,9 @@ class CombinedVisualizer:
 
 
 class HorseGaitMonitor:
-    def __init__(self, model_path, yolo_path, output_dir="monitoring_output"):
-        self.model = VitInference(
-            model_path,
-            yolo_path,
-            model_name="s",
-            yolo_size=320,
-            is_video=True,
-            device="cpu",
-        )
-
+    def __init__(self, engine_path, yolo_path, output_dir="monitoring_output"):
+        self.engine = self.load_engine(engine_path)
+        self.context = self.engine.create_execution_context()
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
@@ -113,6 +107,14 @@ class HorseGaitMonitor:
         self.movement_buffer = []
         self.state_buffer = []
         self.visualizer = CombinedVisualizer()
+
+    def load_engine(self, engine_path):
+        """Loads a TensorRT engine from the given path."""
+        with open(engine_path, 'rb') as f:
+            engine_data = f.read()
+        runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+        engine = runtime.deserialize_cuda_engine(engine_data)
+        return engine
 
     def calculate_angle(self, p1, p2, p3):
         """Calculate angle between three points."""
@@ -271,7 +273,7 @@ class HorseGaitMonitor:
                 if not ret:
                     break
 
-                keypoints = self.model.inference(frame)
+                keypoints = self.run_inference(frame)
                 current_state = self.detect_state(keypoints)
 
                 if current_state != last_announced_state:
@@ -301,13 +303,18 @@ class HorseGaitMonitor:
             cv2.destroyAllWindows()
             print(f"\nProcessing complete! Output saved to: {output_path}")
 
+    def run_inference(self, frame):
+        # Code to run inference with TensorRT engine
+        # Use self.context to execute inference
+        pass
+
 
 def main():
-    model_path = "vitpose-l-ap10k.onnx"
+    engine_path = "vitpose.engine"  # TensorRT engine model
     yolo_path = "yolov8x.pt"
-    monitor = HorseGaitMonitor(model_path, yolo_path)
+    monitor = HorseGaitMonitor(engine_path, yolo_path)
 
-    video_path = "blackwalk.mp4"
+    video_path = "videos/walking.mp4"
     try:
         monitor.process_video(video_path)
     except Exception as e:
