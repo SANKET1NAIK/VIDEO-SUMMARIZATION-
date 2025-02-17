@@ -108,12 +108,31 @@ class HorseGaitMonitor:
         self.state_buffer = []
         self.visualizer = CombinedVisualizer()
 
-    def load_engine(self, engine_path):
-        """Loads a TensorRT engine from the given path."""
-        with open(engine_path, 'rb') as f:
+    def load_engine(self,engine_path):
+        """Loads a TensorRT engine from the given path with debug info."""
+        if not os.path.exists(engine_path):
+            raise FileNotFoundError(f"❌ Engine file not found: {engine_path}")
+    
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+    
+        print(f"✅ Found engine file: {engine_path}")
+    
+        with open(engine_path, "rb") as f:
             engine_data = f.read()
-        runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+    
+        if not engine_data:
+            raise ValueError("❌ Engine file is empty or corrupted.")
+    
         engine = runtime.deserialize_cuda_engine(engine_data)
+    
+        if engine is None:
+            raise ValueError("❌ Failed to deserialize TensorRT engine. Possible causes:\n"
+                             "   - Engine file is incompatible with this TensorRT version\n"
+                             "   - Engine file is corrupted\n"
+                             "   - Engine file was built on a different GPU architecture")
+    
+        print("✅ Successfully loaded TensorRT engine!")
         return engine
 
     def calculate_angle(self, p1, p2, p3):
@@ -304,17 +323,20 @@ class HorseGaitMonitor:
             print(f"\nProcessing complete! Output saved to: {output_path}")
 
     def run_inference(self, frame):
-        # Code to run inference with TensorRT engine
-        # Use self.context to execute inference
-        pass
+        
+    # Your inference logic here (ensure it is implemented)
+        keypoints = {}  # Replace with actual model inference output
+        print("Inference output:", keypoints)  # Debugging line
+        return keypoints
+
 
 
 def main():
-    engine_path = "vitpose.engine"  # TensorRT engine model
-    yolo_path = "yolov8x.pt"
+    engine_path = "E:/vitpose.engine"  # TensorRT engine model
+    yolo_path = "E:/yolov8n.pt"
     monitor = HorseGaitMonitor(engine_path, yolo_path)
 
-    video_path = "videos/walking.mp4"
+    video_path = "E:/vitpose/walk.mp4"
     try:
         monitor.process_video(video_path)
     except Exception as e:
