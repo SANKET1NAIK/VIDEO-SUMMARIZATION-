@@ -1,319 +1,198 @@
-import cv2
-import numpy as np
-from easy_ViTPose.easy_ViTPose import VitInference
 import os
-from collections import deque
+import numpy as np
+import cv2
+import torch
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+import matplotlib.pyplot as plt
+from time import time
+from PIL import Image
+from torchvision.transforms import transforms
+
+# Visualization imports
+from vit_utils.visualization import draw_points_and_skeleton, joints_dict
+from vit_utils.top_down_eval import keypoints_from_heatmaps
 
 
-class CombinedVisualizer:
-    def __init__(self, window_size=100):
-        self.window_size = window_size
-        self.activities = deque(maxlen=window_size)
-        self.activity_counts = {
-            "walking": 0,
-            "standing": 0,
-            "sitting": 0,
-            "pawing": 0,
-            "Unknown": 0,
-        }
-        self.total_frames = 0
+# 1️⃣  Load and Convert ONNX to TensorRT Engine
+def export_engine(onnx_path, im, engine_path, half=False, dynamic=True, workspace=4, verbose=False, prefix='Tensorrt'):
+    """Converts an ONNX model to a TensorRT engine (compatible with TensorRT 10+)."""
+    
+    logger = trt.Logger(trt.Logger.INFO)
+    if verbose:
+        logger.min_severity = trt.Logger.Severity.VERBOSE
 
-    def update(self, activity):
-        self.activities.append(activity)
-        self.activity_counts[activity] += 1
-        self.total_frames += 1
+    builder = trt.Builder(logger)
+    config = builder.create_builder_config()
 
-    def create_visualization(self, frame):
-        frame_height, frame_width = frame.shape[:2]
-        defrag_height = 150
-        defrag_width = frame_width
-        defrag_image = np.ones((defrag_height, defrag_width, 3), dtype=np.uint8) * 255
+    # 🔹 FIX: Use set_memory_pool_limit for TensorRT 10+
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace * (1 << 30))
 
-        colors = {
-            "walking": (0, 0, 255),  # Red
-            "standing": (255, 0, 0),  # Blue
-            "sitting": (0, 255, 0),  # Green
-            "pawing": (255, 165, 0),  # Orange
-            "Unknown": (128, 128, 128),  # Gray
-        }
+    flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    network = builder.create_network(flag)
+    parser = trt.OnnxParser(network, logger)
 
-        segment_width = defrag_width // self.window_size
-        for i, activity in enumerate(self.activities):
-            x_start = i * segment_width
-            x_end = x_start + segment_width
-            color = colors.get(activity, (128, 128, 128))
-            cv2.rectangle(defrag_image, (x_start, 0), (x_end, 80), color, -1)
+    # Parse ONNX model
+    if not parser.parse_from_file(str(onnx_path)):
+        print(f"Failed to parse ONNX file: {onnx_path}")
+        for error in range(parser.num_errors):
+            print(parser.get_error(error))  # Print parsing errors
+        raise RuntimeError(f"ONNX parsing failed: {onnx_path}")
 
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        legend_items = [
-            ("Walking", (0, 0, 255)),
-            ("Standing", (255, 0, 0)),
-            ("Sitting", (0, 255, 0)),
-            ("Pawing", (255, 165, 0)),
-            ("Unknown", (128, 128, 128)),
-        ]
+    # Display model inputs/outputs
+    inputs = [network.get_input(i) for i in range(network.num_inputs)]
+    outputs = [network.get_output(i) for i in range(network.num_outputs)]
+    
+    for inp in inputs:
+        print(f"{prefix} input: {inp.name}, Shape: {inp.shape}, Type: {inp.dtype}")
+    for out in outputs:
+        print(f"{prefix} output: {out.name}, Shape: {out.shape}, Type: {out.dtype}")
 
-        x_offset = 10
-        y_offset = 120
-        for text, color in legend_items:
-            cv2.rectangle(
-                defrag_image,
-                (x_offset, y_offset - 15),
-                (x_offset + 20, y_offset + 5),
-                color,
-                -1,
-            )
-            percentage = (
-                self.activity_counts.get(text.lower(), 0) / max(1, self.total_frames)
-            ) * 100
-            cv2.putText(
-                defrag_image,
-                f"{text}: {percentage:.1f}%",
-                (x_offset + 30, y_offset),
-                font,
-                0.5,
-                (0, 0, 0),
-                1,
-            )
-            x_offset += 160
+    # Handle dynamic batch size
+    if dynamic:
+        profile = builder.create_optimization_profile()
+        for inp in inputs:
+            profile.set_shape(inp.name, (1, *im.shape[1:]), (max(1, im.shape[0] // 2), *im.shape[1:]), im.shape)
+        config.add_optimization_profile(profile)
 
-        combined_height = frame_height + defrag_height
-        combined_image = np.zeros((combined_height, frame_width, 3), dtype=np.uint8)
-        combined_image[:frame_height] = frame
-        combined_image[frame_height:] = defrag_image
+    # Enable FP16 if supported
+    if builder.platform_has_fast_fp16 and half:
+        config.set_flag(trt.BuilderFlag.FP16)
 
-        return combined_image
+    # 🔹 FIX: Use build_serialized_network() for TensorRT 10+
+    print(f"{prefix} building FP{16 if half else 32} engine...")
+    serialized_engine = builder.build_serialized_network(network, config)
+    if serialized_engine is None:
+        raise RuntimeError("Failed to build serialized TensorRT engine!")
+
+    # Save engine
+    with open(engine_path, 'wb') as f:
+        f.write(serialized_engine)
+
+    print(f"✅ TensorRT engine saved at {engine_path}")
+    return True
 
 
-class HorseGaitMonitor:
-    def __init__(self, model_path, yolo_path, output_dir="monitoring_output"):
-        self.model = VitInference(
-            model_path,
-            yolo_path,
-            model_name="s",
-            yolo_size=320,
-            is_video=True,
-            device="cpu",
-        )
 
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
 
-        # Create directories for saving frames
-        self.pose_dirs = {
-            "standing": os.path.join(output_dir, "standing"),
-            "walking": os.path.join(output_dir, "walking"),
-            "sitting": os.path.join(output_dir, "sitting"),
-            "pawing": os.path.join(output_dir, "pawing"),
-        }
-        for dir_path in self.pose_dirs.values():
-            os.makedirs(dir_path, exist_ok=True)
 
-        self.prev_positions = None
-        self.movement_buffer = []
-        self.state_buffer = []
-        self.visualizer = CombinedVisualizer()
+# 2️⃣  Load TensorRT Engine
+def load_engine(trt_runtime, engine_path):
+    """Loads the TensorRT engine."""
+    with open(engine_path, "rb") as f:
+        engine_data = f.read()
+    return trt_runtime.deserialize_cuda_engine(engine_data)
 
-    def calculate_angle(self, p1, p2, p3):
-        """Calculate angle between three points."""
-        v1 = p1 - p2
-        v2 = p3 - p2
 
-        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-        angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+# 3️⃣  Allocate Buffers
+def allocate_buffers(engine):
+    """Allocates memory for inputs/outputs with dynamic shapes."""
+    inputs, outputs, bindings = [], [], []
+    stream = cuda.Stream()
 
-        return angle
+    for binding in engine:
+        # Get shape and dtype dynamically
+        shape = engine.get_tensor_shape(binding)
+        dtype = trt.nptype(engine.get_binding_dtype(binding))
 
-    def detect_state(self, keypoints):
-        current_positions = None
-        movement_detected = False
+        # Calculate size of the buffer
+        size = trt.volume(shape) * engine.get_max_batch_size()
+        host_mem = cuda.pagelocked_empty(size, dtype)
+        device_mem = cuda.mem_alloc(host_mem.nbytes)
 
-        for person_id, kp_array in keypoints.items():
-            # Extract leg keypoints
-            leg_points = {
-                "L_F_Knee": kp_array[6][:2],  # Left Front Knee
-                "L_F_Paw": kp_array[7][:2],  # Left Front Paw
-                "R_F_Knee": kp_array[9][:2],  # Right Front Knee
-                "R_F_Paw": kp_array[10][:2],  # Right Front Paw
-                "L_B_Knee": kp_array[12][:2],  # Left Back Knee
-                "L_B_Paw": kp_array[13][:2],  # Left Back Paw
-                "R_B_Knee": kp_array[15][:2],  # Right Back Knee
-                "R_B_Paw": kp_array[16][:2],  # Right Back Paw
-                "L_F_Hip": kp_array[5][:2],  # Left Front Hip
-                "R_F_Hip": kp_array[8][:2],  # Right Front Hip
-                "L_B_Hip": kp_array[11][:2],  # Left Back Hip
-                "R_B_Hip": kp_array[14][:2],  # Right Back Hip
-            }
-
-            # Calculate leg angles
-            left_front_angle = self.calculate_angle(
-                np.array(leg_points["L_F_Hip"]),
-                np.array(leg_points["L_F_Knee"]),
-                np.array(leg_points["L_F_Paw"]),
-            )
-
-            right_front_angle = self.calculate_angle(
-                np.array(leg_points["R_F_Hip"]),
-                np.array(leg_points["R_F_Knee"]),
-                np.array(leg_points["R_F_Paw"]),
-            )
-
-            left_back_angle = self.calculate_angle(
-                np.array(leg_points["L_B_Hip"]),
-                np.array(leg_points["L_B_Knee"]),
-                np.array(leg_points["L_B_Paw"]),
-            )
-
-            right_back_angle = self.calculate_angle(
-                np.array(leg_points["R_B_Hip"]),
-                np.array(leg_points["R_B_Knee"]),
-                np.array(leg_points["R_B_Paw"]),
-            )
-
-            # Check for pawing
-            if 100 <= left_front_angle <= 130 or 100 <= right_front_angle <= 130:
-                return "pawing"
-
-            # Check for sitting
-            if all(
-                angle < 90
-                for angle in [
-                    left_front_angle,
-                    right_front_angle,
-                    left_back_angle,
-                    right_back_angle,
-                ]
-            ):
-                return "sitting"
-
-            # Check for walking/standing
-            paw_positions = np.array(
-                [
-                    leg_points["L_F_Paw"],
-                    leg_points["R_F_Paw"],
-                    leg_points["L_B_Paw"],
-                    leg_points["R_B_Paw"],
-                ]
-            )
-
-            if self.prev_positions is not None:
-                movements = np.linalg.norm(paw_positions - self.prev_positions, axis=1)
-                self.movement_buffer.append(np.mean(movements))
-                if len(self.movement_buffer) > 10:
-                    self.movement_buffer.pop(0)
-
-                avg_movement = np.mean(self.movement_buffer)
-                movement_detected = avg_movement > 5.0
-
-            self.prev_positions = paw_positions
-
-        current_state = "walking" if movement_detected else "standing"
-        self.state_buffer.append(current_state)
-        if len(self.state_buffer) > 15:
-            self.state_buffer.pop(0)
-
-        return max(set(self.state_buffer), key=self.state_buffer.count)
-
-    def draw_state_annotation(self, frame, state):
-        if isinstance(frame, np.ndarray):
-            annotated_frame = frame.copy()
+        bindings.append(int(device_mem))
+        if engine.binding_is_input(binding):
+            inputs.append({"host": host_mem, "device": device_mem})
         else:
-            annotated_frame = np.array(frame)
+            outputs.append({"host": host_mem, "device": device_mem})
 
-        colors = {
-            "standing": (255, 0, 0),  # Blue
-            "walking": (0, 0, 255),  # Red
-            "sitting": (0, 255, 0),  # Green
-            "pawing": (255, 165, 0),  # Orange
-        }
-
-        cv2.putText(
-            annotated_frame,
-            f"State: {state.upper()}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            colors.get(state, (128, 128, 128)),
-            2,
-        )
-
-        return annotated_frame
-
-    def save_frame(self, frame, state, frame_count):
-        if state in self.pose_dirs:
-            filename = os.path.join(self.pose_dirs[state], f"frame_{frame_count}.jpg")
-            cv2.imwrite(filename, frame)
-
-    def process_video(self, video_path):
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise ValueError(f"Could not open video file: {video_path}")
-
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        combined_height = height + 150
-        output_path = os.path.join(self.output_dir, "video_with_analysis.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, combined_height))
-
-        frame_count = 0
-        current_state = None
-        last_announced_state = None
-
-        cv2.namedWindow("Horse Gait Analysis", cv2.WINDOW_NORMAL)
-
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                keypoints = self.model.inference(frame)
-                current_state = self.detect_state(keypoints)
-
-                if current_state != last_announced_state:
-                    print(f"Frame {frame_count}: Horse is now {current_state}")
-                    last_announced_state = current_state
-
-                annotated_frame = self.draw_state_annotation(frame, current_state)
-                self.save_frame(annotated_frame, current_state, frame_count)
-
-                self.visualizer.update(current_state)
-                combined_display = self.visualizer.create_visualization(annotated_frame)
-
-                cv2.imshow("Horse Gait Analysis", combined_display)
-                out.write(combined_display)
-
-                frame_count += 1
-                if frame_count % 30 == 0:
-                    progress = (frame_count / total_frames) * 100
-                    print(f"Processing progress: {progress:.1f}%")
-
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-
-        finally:
-            cap.release()
-            out.release()
-            cv2.destroyAllWindows()
-            print(f"\nProcessing complete! Output saved to: {output_path}")
+    return inputs, outputs, bindings, stream
 
 
-def main():
-    model_path = "vitpose-l-ap10k.onnx"
-    yolo_path = "yolov8x.pt"
-    monitor = HorseGaitMonitor(model_path, yolo_path)
 
-    video_path = "walk.mp4"
-    try:
-        monitor.process_video(video_path)
-    except Exception as e:
-        print(f"Error processing video: {str(e)}")
-        raise
+# 4️⃣  Run Inference
+def do_inference(context, bindings, inputs, outputs, stream):
+    """Runs inference on the TensorRT engine."""
+    for inp in inputs:
+        cuda.memcpy_htod_async(inp["device"], inp["host"], stream)
+
+    context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+
+    for out in outputs:
+        cuda.memcpy_dtoh_async(out["host"], out["device"], stream)
+
+    stream.synchronize()
+    return [out["host"] for out in outputs]
 
 
-if __name__ == "__main__":
-    main()
+# 5️⃣  Convert ONNX to TensorRT
+ONNX_PATH = "E:/vitpose-l-ap10k.onnx"
+TRT_PATH = ONNX_PATH.replace('.onnx', '.engine')
+
+C, H, W = 3, 256, 192
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+sample_input = torch.randn(1, C, H, W).to(device)
+
+export_engine(ONNX_PATH, sample_input, TRT_PATH, half=False, dynamic=True)
+
+
+# 6️⃣  Load TensorRT Model for Inference
+logger = trt.Logger(trt.Logger.ERROR)
+trt_runtime = trt.Runtime(logger)
+
+print(f"Loading TensorRT engine from {TRT_PATH}...")
+trt_engine = load_engine(trt_runtime, TRT_PATH)
+
+# Allocate buffers
+inputs, outputs, bindings, stream = allocate_buffers(trt_engine)
+
+# Create execution context
+context = trt_engine.create_execution_context()
+
+
+# 7️⃣  Prepare Image for Inference
+IMG_PATH = "E:\lame.webp"
+img = cv2.cvtColor(cv2.imread(IMG_PATH), cv2.COLOR_BGR2RGB)
+org_h, org_w = img.shape[:2]
+
+# Preprocess Image
+img_input = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+img_input = img_input.astype(np.float32).transpose(2, 0, 1)[None, ...] / 255.0
+
+# Copy to GPU memory
+np.copyto(inputs[0]["host"], img_input.ravel())
+
+
+# 8️⃣  Run Inference
+tic = time()
+heatmaps = do_inference(context, bindings=bindings, inputs=inputs, outputs=outputs, stream=stream)[0]
+heatmaps = heatmaps.reshape((1, 25, 64, 48))
+elapsed_time = time() - tic
+
+print(f"Output size: {heatmaps.shape}, Time elapsed: {elapsed_time:.4f}s, FPS: {1/elapsed_time:.1f}")
+
+
+# 9️⃣  Postprocess & Visualization
+points, prob = keypoints_from_heatmaps(
+    heatmaps=heatmaps, 
+    center=np.array([[org_w // 2, org_h // 2]]), 
+    scale=np.array([[org_w, org_h]]), 
+    unbiased=True, use_udp=True
+)
+
+points = np.concatenate([points[:, :, ::-1], prob], axis=2)
+
+# Draw Keypoints
+for pid, point in enumerate(points):
+    img_vis = draw_points_and_skeleton(
+        img.copy(), point, joints_dict()["coco"]["skeleton"], person_index=pid,
+        points_color_palette="gist_rainbow", skeleton_color_palette="jet",
+        points_palette_samples=10, confidence_threshold=0.4
+    )
+    
+    plt.figure(figsize=(5, 10))
+    plt.imshow(img_vis)
+    plt.title("Result")
+    plt.axis("off")
+    plt.show() dont convert the file we have file already just run the inference
