@@ -91,9 +91,11 @@ class CombinedVisualizer:
 class TensorRTInference:
     """TensorRT inference class for ViTPose model, optimized for GPU with TensorRT 10.8.0.43"""
     def __init__(self, engine_path):
+        """Initialize TensorRT engine and allocate buffers on GPU."""
         self.logger = trt.Logger(trt.Logger.INFO)
         self.runtime = trt.Runtime(self.logger)
 
+        # Load engine from file
         with open(engine_path, 'rb') as f:
             engine_bytes = f.read()
             self.engine = self.runtime.deserialize_cuda_engine(engine_bytes)
@@ -103,15 +105,19 @@ class TensorRTInference:
 
         self.context = self.engine.create_execution_context()
         
-        self.input_shape = (1, 3, 256, 192)
-        self.output_shape = (1, 17, 64, 48)
+        # Define input and output shapes
+        self.input_shape = (1, 3, 256, 192)  # ViTPose standard input
+        self.output_shape = (1, 17, 64, 48)  # ViTPose standard output (17 keypoints)
         
+        # Tensor names (adjust based on your engine)
         self.input_name = "input"
         self.output_name = "output"
         
+        # Allocate GPU buffers
         self.allocate_buffers()
 
     def allocate_buffers(self):
+        """Allocate CUDA memory for inputs and outputs."""
         self.inputs = []
         self.outputs = []
         self.bindings = []
@@ -129,6 +135,7 @@ class TensorRTInference:
             else:
                 raise ValueError(f"Unsupported dtype: {tensor_dtype}")
 
+            # Explicitly allocate on GPU (CUDA)
             tensor = torch.zeros(tuple(tensor_shape), dtype=torch_dtype, device='cuda')
             self.bindings.append(tensor.data_ptr())
             
@@ -140,41 +147,52 @@ class TensorRTInference:
             self.context.set_tensor_address(tensor_name, tensor.data_ptr())
 
     def preprocess_image(self, img):
+        """Preprocess image for model input on GPU."""
+        # Convert to RGB and resize on CPU first (cv2 doesn't support GPU natively)
         img = cv2.resize(img, (192, 256))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32) / 255.0
-        img = img.transpose(2, 0, 1)
-        img = np.expand_dims(img, axis=0)
+        img = img.transpose(2, 0, 1)  # HWC to CHW
+        img = np.expand_dims(img, axis=0)  # Add batch dimension
+        
+        # Move to GPU
         return torch.from_numpy(img).to('cuda')
 
     def postprocess_output(self, output):
+        """Convert model output to keypoints on GPU, then move to CPU for further processing."""
         heatmaps = output.reshape(self.output_shape)
         keypoints = {}
         for batch_idx in range(heatmaps.shape[0]):
-            person_keypoints = torch.zeros((17, 3), device='cuda')
+            person_keypoints = torch.zeros((17, 3), device='cuda')  # Process on GPU
             for kpt_idx in range(17):
                 heatmap = heatmaps[batch_idx, kpt_idx]
                 flat_idx = torch.argmax(heatmap)
                 y, x = torch.unravel_index(flat_idx, heatmap.shape)
-                orig_x = x * (192 / 48)
-                orig_y = y * (256 / 64)
+                orig_x = x * (192 / 48)  # Scale to input width
+                orig_y = y * (256 / 64)  # Scale to input height
                 confidence = heatmap[y, x]
                 person_keypoints[kpt_idx] = torch.tensor([orig_x, orig_y, confidence], device='cuda')
-            keypoints[batch_idx] = person_keypoints.cpu().numpy()
+            keypoints[batch_idx] = person_keypoints.cpu().numpy()  # Move to CPU for compatibility
         return keypoints
     
     def infer(self, img):
+        """Run inference on an image using GPU."""
         preprocessed = self.preprocess_image(img)
         self.inputs[0].copy_(preprocessed)
+        
+        # Execute inference asynchronously on GPU
         self.context.execute_async_v3(stream_handle=torch.cuda.current_stream().cuda_stream)
-        torch.cuda.synchronize()
-        output = self.outputs[0]
+        torch.cuda.synchronize()  # Wait for GPU computation to finish
+        
+        output = self.outputs[0]  # Already on GPU
         keypoints = self.postprocess_output(output)
         return keypoints
 
 class HorseGaitMonitor:
     def __init__(self, model_path, output_dir="monitoring_output"):
+        """Initialize the horse gait monitoring system with TensorRT on GPU."""
         self.model = TensorRTInference(model_path)
+        
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
@@ -187,49 +205,73 @@ class HorseGaitMonitor:
         for dir_path in self.pose_dirs.values():
             os.makedirs(dir_path, exist_ok=True)
 
-        self.prev_positions = [None, None]
-        self.movement_buffer = [[], []]
-        self.state_buffer = [[], []]
-        self.visualizers = [CombinedVisualizer(), CombinedVisualizer()]
+        self.prev_positions = None
+        self.movement_buffer = []
+        self.state_buffer = []
+        self.visualizer = CombinedVisualizer()
         
-        self.front_paw_positions_history = [deque(maxlen=30), deque(maxlen=30)]
-        self.front_leg_angles_history = [deque(maxlen=30), deque(maxlen=30)]
-        self.pawing_pattern_count = [0, 0]
-        self.pawing_cooldown = [0, 0]
-        self.pawing_detection_threshold = 3
-        self.pawing_angle_threshold = (100, 140)
+        # New variables for improved pawing detection
+        self.front_paw_positions_history = deque(maxlen=30)  # Store past positions for pattern analysis
+        self.front_leg_angles_history = deque(maxlen=30)     # Store past angles for pattern analysis
+        self.pawing_pattern_count = 0                       # Counter for potential pawing patterns
+        self.pawing_cooldown = 0                           # Cooldown after pawing is detected
+        self.pawing_detection_threshold = 3                # Number of repetitions to confirm pawing
+        self.pawing_angle_threshold = (100, 140)           # Angle range for potential pawing
 
     def calculate_angle(self, p1, p2, p3):
+        """Calculate angle between three points (CPU-based for simplicity)."""
         v1 = p1 - p2
         v2 = p3 - p2
         cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
         angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
         return angle
 
-    def detect_pawing_pattern(self, front_paw_positions, front_leg_angles, camera_idx):
-        self.front_paw_positions_history[camera_idx].append(front_paw_positions)
-        self.front_leg_angles_history[camera_idx].append(front_leg_angles)
+    def detect_pawing_pattern(self, front_paw_positions, front_leg_angles):
+        """
+        Detect pawing pattern by analyzing the history of front paw movements and leg angles.
+        Pawing is characterized by repetitive vertical movement of front legs with specific angle patterns.
+        """
+        # Add current positions and angles to history
+        self.front_paw_positions_history.append(front_paw_positions)
+        self.front_leg_angles_history.append(front_leg_angles)
         
-        if len(self.front_paw_positions_history[camera_idx]) < 10:
+        # Need enough history to detect pattern
+        if len(self.front_paw_positions_history) < 10:
             return False
             
-        for leg_idx in range(2):
-            y_positions = np.array([pos[leg_idx][1] for pos in self.front_paw_positions_history[camera_idx]])
+        # Check for pawing in either front leg
+        for leg_idx in range(2):  # 0 for left front, 1 for right front
+            # Extract vertical (y) position history for this leg
+            y_positions = np.array([pos[leg_idx][1] for pos in self.front_paw_positions_history])
+            
+            # Calculate vertical movements (positive values = downward movement)
             y_movements = np.diff(y_positions)
+            
+            # Check angle history for this leg
+            angles = np.array([angles[leg_idx] for angles in self.front_leg_angles_history])
+            
+            # Pawing pattern detection:
+            # 1. Find direction changes (up to down and down to up)
             direction_changes = np.sign(y_movements[1:]) != np.sign(y_movements[:-1])
             num_direction_changes = np.sum(direction_changes)
             
+            # 2. Check if we have at least 3 direction changes (up-down-up or down-up-down)
             if num_direction_changes >= 3:
+                # 3. Check vertical range of movement (should be significant for pawing)
                 vertical_range = np.max(y_positions) - np.min(y_positions)
-                angles = np.array([angles[leg_idx] for angles in self.front_leg_angles_history[camera_idx]])
-                angles_in_range = np.any((angles >= self.pawing_angle_threshold[0]) & 
-                                       (angles <= self.pawing_angle_threshold[1]))
                 
+                # 4. Check if angles were in pawing range at some point
+                angles_in_range = np.any((angles >= self.pawing_angle_threshold[0]) & 
+                                         (angles <= self.pawing_angle_threshold[1]))
+                
+                # Confirm pawing if movement range is significant and angles were appropriate
                 if vertical_range > 15 and angles_in_range:
                     return True
+                    
         return False
 
-    def detect_state(self, keypoints, camera_idx):
+    def detect_state(self, keypoints):
+        """Enhanced detect_state method with improved pawing detection."""
         movement_detected = False
 
         for person_id, kp_array in keypoints.items():
@@ -271,27 +313,41 @@ class HorseGaitMonitor:
                 )
             }
             
-            front_paw_positions = [leg_points["L_F_Paw"], leg_points["R_F_Paw"]]
-            front_leg_angles = [angles["left_front"], angles["right_front"]]
+            # Extract front paw positions for pattern analysis
+            front_paw_positions = [
+                leg_points["L_F_Paw"],
+                leg_points["R_F_Paw"]
+            ]
             
-            is_pawing_pattern = self.detect_pawing_pattern(front_paw_positions, front_leg_angles, camera_idx)
+            # Extract front leg angles for pattern analysis
+            front_leg_angles = [
+                angles["left_front"],
+                angles["right_front"]
+            ]
             
-            if self.pawing_cooldown[camera_idx] > 0:
-                self.pawing_cooldown[camera_idx] -= 1
+            # Improved pawing detection using repetitive pattern analysis
+            is_pawing_pattern = self.detect_pawing_pattern(front_paw_positions, front_leg_angles)
+            
+            # State determination with cooldown logic for pawing
+            if self.pawing_cooldown > 0:
+                self.pawing_cooldown -= 1
                 return "pawing"
                 
             if is_pawing_pattern:
-                self.pawing_pattern_count[camera_idx] += 1
-                if self.pawing_pattern_count[camera_idx] >= self.pawing_detection_threshold:
-                    self.pawing_pattern_count[camera_idx] = 0
-                    self.pawing_cooldown[camera_idx] = 15
+                self.pawing_pattern_count += 1
+                if self.pawing_pattern_count >= self.pawing_detection_threshold:
+                    self.pawing_pattern_count = 0
+                    self.pawing_cooldown = 15  # Keep "pawing" state for 15 frames after detection
                     return "pawing"
             else:
-                self.pawing_pattern_count[camera_idx] = max(0, self.pawing_pattern_count[camera_idx] - 0.5)
+                # Gradually decrease the pattern count when no pawing is detected
+                self.pawing_pattern_count = max(0, self.pawing_pattern_count - 0.5)
             
+            # Check for sitting behavior
             if all(angle < 90 for angle in angles.values()):
                 return "sitting"
 
+            # Movement detection for walking vs standing
             paw_positions = np.array([
                 leg_points["L_F_Paw"],
                 leg_points["R_F_Paw"],
@@ -299,103 +355,77 @@ class HorseGaitMonitor:
                 leg_points["R_B_Paw"]
             ])
 
-            if self.prev_positions[camera_idx] is not None:
-                movements = np.linalg.norm(paw_positions - self.prev_positions[camera_idx], axis=1)
-                self.movement_buffer[camera_idx].append(np.mean(movements))
-                if len(self.movement_buffer[camera_idx]) > 10:
-                    self.movement_buffer[camera_idx].pop(0)
-                movement_detected = np.mean(self.movement_buffer[camera_idx]) > 5.0
+            if self.prev_positions is not None:
+                movements = np.linalg.norm(paw_positions - self.prev_positions, axis=1)
+                self.movement_buffer.append(np.mean(movements))
+                if len(self.movement_buffer) > 10:
+                    self.movement_buffer.pop(0)
+                movement_detected = np.mean(self.movement_buffer) > 5.0
 
-            self.prev_positions[camera_idx] = paw_positions
+            self.prev_positions = paw_positions
 
         current_state = "walking" if movement_detected else "standing"
-        self.state_buffer[camera_idx].append(current_state)
-        if len(self.state_buffer[camera_idx]) > 15:
-            self.state_buffer[camera_idx].pop(0)
-        return max(set(self.state_buffer[camera_idx]), key=self.state_buffer[camera_idx].count)
+        self.state_buffer.append(current_state)
+        if len(self.state_buffer) > 15:
+            self.state_buffer.pop(0)
+        return max(set(self.state_buffer), key=self.state_buffer.count)
 
-    def save_frame(self, frame, state, frame_count, camera_idx):
+    def draw_state_annotation(self, frame, state):
+        """Draw state annotation on frame without detailed visualization."""
+        # Simply return the original frame without any annotations
+        return frame
+
+    def save_frame(self, frame, state, frame_count):
+        """Save frame to appropriate directory based on state."""
         if state in self.pose_dirs:
-            filename = os.path.join(self.pose_dirs[state], f"cam{camera_idx + 1}_frame_{frame_count}.jpg")
+            filename = os.path.join(self.pose_dirs[state], f"frame_{frame_count}.jpg")
             cv2.imwrite(filename, frame)
 
-    def process_nvr_cameras(self, nvr_ip="192.168.1.113", username="admin", password="Jepl@1234", channels=[1, 2], port=554):
-        """Process live feeds from two cameras via NVR with debugging."""
-        rtsp_urls = [
-            f"rtsp://{username}:{password}@{nvr_ip}:{port}/Streaming/Channels/{channels[0]}01",  # Camera 1: 192.168.1.101
-            f"rtsp://{username}:{password}@{nvr_ip}:{port}/Streaming/Channels/{channels[1]}01"   # Camera 2: 192.168.1.102
-        ]
-        print("Attempting to connect to the following RTSP URLs via NVR:")
-        for i, url in enumerate(rtsp_urls):
-            print(f"Camera {i + 1} (Channel {channels[i]}): {url}")
+    def draw_keypoints(self, frame, keypoints):
+        """Return original frame without keypoints drawing."""
+        # Simply return the original frame without drawing keypoints
+        return frame
 
-        # Fallback: Direct camera IPs
-        fallback_urls = [
-            f"rtsp://{username}:{password}@192.168.1.101:{port}/stream",
-            f"rtsp://{username}:{password}@192.168.1.102:{port}/stream"
-        ]
-        print("Fallback direct camera IPs available:")
-        for i, url in enumerate(fallback_urls):
-            print(f"Camera {i + 1} (Direct IP): {url}")
+    def process_video(self, video_path):
+        """Process video file and analyze horse gait on GPU."""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video file: {video_path}")
 
-        caps = [cv2.VideoCapture(url) for url in rtsp_urls]
-        for i, cap in enumerate(caps):
-            if not cap.isOpened():
-                print(f"Error: Could not open NVR stream for camera {i + 1}. Trying direct IP...")
-                caps[i] = cv2.VideoCapture(fallback_urls[i])
-                if not caps[i].isOpened():
-                    print(f"Error: Could not open direct stream {i + 1}. Verify URL, network, and camera settings.")
-                    print(f"Suggestion: Test the URL in VLC: {fallback_urls[i]}")
-                    raise ValueError(f"Could not open camera stream {i + 1}")
-                else:
-                    print(f"Camera {i + 1} direct stream opened successfully.")
-            else:
-                print(f"Camera {i + 1} NVR stream opened successfully.")
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        width = int(caps[0].get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(caps[0].get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(caps[0].get(cv2.CAP_PROP_FPS)) or 30
-
-        combined_height = height + 150
-        output_path = os.path.join(self.output_dir, "nvr_dual_camera_analysis.mp4")
+        combined_height = height + 150  # Add space for visualizer
+        output_path = os.path.join(self.output_dir,"video_with_analysis4.mp4")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width * 2, combined_height))
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, combined_height))
 
         frame_count = 0
-        cv2.namedWindow("Horse Gait Analysis - NVR Cameras", cv2.WINDOW_NORMAL)
+        last_announced_state = None
+
+        cv2.namedWindow("Horse Gait Analysis", cv2.WINDOW_NORMAL)
 
         try:
             while True:
-                frames = []
-                for i, cap in enumerate(caps):
-                    ret, frame = cap.read()
-                    if not ret:
-                        print(f"Failed to grab frame from camera {i + 1}")
-                        break
-                    frames.append(frame)
-
-                if len(frames) != 2:
+                ret, frame = cap.read()
+                if not ret:
                     break
 
-                states = []
-                annotated_frames = []
-                for i, frame in enumerate(frames):
-                    keypoints = self.model.infer(frame)
-                    current_state = self.detect_state(keypoints, i)
-                    states.append(current_state)
-                    
-                    annotated_frame = frame.copy()
-                    self.save_frame(annotated_frame, current_state, frame_count, i)
-                    annotated_frames.append(annotated_frame)
-                    self.visualizers[i].update(current_state)
+                keypoints = self.model.infer(frame)
+                current_state = self.detect_state(keypoints)
+                
+                # No keypoint visualization
+                annotated_frame = frame.copy()
+                
+                self.save_frame(annotated_frame, current_state, frame_count)
 
-                combined_frame = np.hstack((annotated_frames[0], annotated_frames[1]))
-                vis1 = self.visualizers[0].create_visualization(annotated_frames[0])
-                vis2 = self.visualizers[1].create_visualization(annotated_frames[1])
-                combined_display = np.hstack((vis1[:, :width], vis2[:, :width]))
+                self.visualizer.update(current_state)
+                combined_display = self.visualizer.create_visualization(annotated_frame)
 
+                cv2.imshow("Horse Gait Analysis", combined_display)
                 out.write(combined_display)
-                cv2.imshow("Horse Gait Analysis - NVR Cameras", combined_display)
 
                 frame_count += 1
 
@@ -403,26 +433,21 @@ class HorseGaitMonitor:
                     break
 
         finally:
-            for cap in caps:
-                cap.release()
+            cap.release()
             out.release()
             cv2.destroyAllWindows()
             print(f"\nProcessing complete! Output saved to: {output_path}")
 
 def main():
+    """Main function to run the horse gait analysis on GPU."""
     engine_path = "C:/Users/hp/Downloads/vitpose-l-ap10k.engine"
-    nvr_ip = "192.168.1.113"      # Your NVR IP address
-    username = "admin"            # NVR and camera username
-    password = "Jepl@1234"        # NVR and camera password
-    channels = [1, 2]             # Channels for 192.168.1.101 and 192.168.1.102
-    port = 554                    # Default RTSP port
-    
     try:
+        # Print GPU info
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
         monitor = HorseGaitMonitor(engine_path)
-        monitor.process_nvr_cameras(nvr_ip, username, password, channels, port)
+        monitor.process_video(r"E:\vitpose\strach.mp4")
     except Exception as e:
-        print(f"Error processing NVR camera feeds: {str(e)}")
+        print(f"Error processing video: {str(e)}")
         raise
 
 if __name__ == "__main__":
